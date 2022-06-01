@@ -1,0 +1,831 @@
+---
+### # ---------------------------------------------------
+### # ZTP A NEW SITE WITH SERVICENOW
+### # ---------------------------------------------------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  any_errors_fatal: "{{ any_errors_fatal | default(true) }}"
+  tasks:
+    - name: Site - Get GPS information for physical address
+      block:
+        - name: "Site: Format street address"
+          ansible.builtin.set_fact:
+            gps_address: "{{ site_address | street_address }}"
+
+        - name: "Site: Geocoding street address"
+          ansible.builtin.uri:
+            url: "http://api.positionstack.com/v1/forward?access_key={{ geo_api.token }}&query={{ gps_address }}"
+            return_content: true
+            headers:
+              Content-Type: application/json
+            method: GET
+            status_code: 200
+          register: gps
+          until: gps is not failed
+          retries: 10
+
+        - name: "Site: building gps object"
+          ansible.builtin.set_fact:
+            gps: "{{ gps['content'] }}"
+
+        - name: "Site: restructuring gps object"
+          ansible.builtin.set_fact:
+            gps: "{{ gps['data'][0] }}"
+
+      when: source_site_from_netbox == "No"
+
+    - name: Site - Create site in Mist with parameters from ServiceNow and GPS lookup
+      block:
+        - name: "Site: create a new site in Mist"
+          cdot65.mist.site:
+            baseurl: "{{ mist.url }}"
+            name: "{{ site_name }}"
+            address: "{{ site_address }}"
+            country_code: "US"
+            timezone: "{{ time_zone }}"
+            latlng:
+              lat: "{{ gps['latitude'] }}"
+              lng: "{{ gps['longitude'] }}"
+            gatewaytemplate_id: "{{ gateway_template_class }}"
+            notes: "{{ notes }}"
+            api_token: "{{ mist.token }}"
+            org_id: "{{ mist.org }}"
+            state: present
+          register: mist_site_created
+
+        - name: "Site: create YAML file for our site variables"
+          ansible.builtin.template:
+            src: "templates/mist/site_vars.j2"
+            dest: "tmp/site_vars.yaml"
+            mode: 0640
+
+        - name: "Site: update site with variables"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/sites/{{ mist_site_created['data']['id'] }}/setting"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/site_vars.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_site_vars
+
+      when: source_site_from_netbox == "No"
+
+    - name: Gateway - Adopt gateway claim code in Mist
+      block:
+        - name: "Gateway: build YAML payload for adoption process"
+          ansible.builtin.template:
+            src: "templates/mist/claim_gateway.j2"
+            dest: "tmp/claim_gateway.yaml"
+            mode: 0640
+
+        - name: "Gateway: adopt claim code"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: POST
+            body: "{{ lookup('file', 'tmp/claim_gateway.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_gateway_claim_result
+
+        - name: "Gateway: clean up adoption output"
+          ansible.builtin.set_fact:
+            mist_inventory: "{{ mist_gateway_claim_result | clean_claim }}"
+
+      when: source_site_from_netbox == "No"
+
+    - name: Gateway - Assign site, host-name, and management
+      block:
+        - name: "Gateway: build YAML payload for associating a gateway to a site"
+          ansible.builtin.template:
+            src: "templates/mist/assign_gateway.j2"
+            dest: "tmp/assign_gateway.yaml"
+            mode: 0640
+
+        - name: "Gateway: associate gateway to site"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/assign_gateway.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_associate_device_to_site
+
+        - name: "Gateway: build YAML payload for configuration management"
+          ansible.builtin.template:
+            src: "templates/mist/manage_gateway.j2"
+            dest: "tmp/manage_gateway.yaml"
+            mode: 0640
+
+        - name: "Gateway: manage the gateway configuration"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/sites/{{ mist_site_created['data']['id'] }}/devices/{{ mist_inventory['id'] }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/manage_gateway.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_manage_gateway
+
+      when: source_site_from_netbox == "No"
+
+    - name: Gateway - Create device-level configuration for the gateway
+      block:
+        - name: "Gateway: create a device configuration"
+          cdot65.mist.gateway:
+            # mist parameters
+            baseurl: "{{ mist.url }}"
+            api_token: "{{ mist.token }}"
+            org_id: "{{ mist.org }}"
+
+            # srx parameters
+            name: "{{ gateway_hostname }}"
+            site_name: "{{ site_name }}"
+            bgp_config:
+              - name: "ATT"
+                type: "external"
+                local_as: 42551
+                auth_key: "juniper123"
+                export_policy: "direct"
+                neighbors:
+                  - name: "74.51.192.0"
+                    neighbor_as: 42550
+                    export_policy: "direct"
+                    import_policy: ""
+            additional_config_cmds:
+              - "set protocols bgp group ATT local-address {{ wan_ip }}"
+            state: "present"
+
+      when: source_site_from_netbox == "No"
+
+    - name: Switch - Adopt switch claim code in Mist
+      block:
+        - name: "Switch: build YAML payload for claim code adoption"
+          ansible.builtin.template:
+            src: "templates/mist/claim_switch.j2"
+            dest: "tmp/claim_switch.yaml"
+            mode: 0640
+
+        - name: "Switch: adopt claim code"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: POST
+            body: "{{ lookup('file', 'tmp/claim_switch.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_switch_claim_result
+
+        - name: "Switch: clean up switch adoption output"
+          ansible.builtin.set_fact:
+            mist_switch_inventory: "{{ mist_switch_claim_result | clean_claim }}"
+
+      when: source_site_from_netbox == "No"
+
+    - name: Switch - Assign site, host-name, and management
+      block:
+        - name: "Switch: build YAML payload for assigning to site"
+          ansible.builtin.template:
+            src: "templates/mist/assign_switch.j2"
+            dest: "tmp/assign_switch.yaml"
+            mode: 0640
+
+        - name: "Switch: assign to site"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/assign_switch.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_associate_device_to_site
+
+        - name: "Switch: build YAML to assign switch configuration template to site"
+          ansible.builtin.template:
+            src: "templates/mist/manage_switch.j2"
+            dest: "tmp/manage_switch.yaml"
+            mode: 0640
+
+        - name: "Switch: assign switch configuration template"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/integration/sites/{{ mist_site_created['data']['id'] }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/manage_switch.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_manage_switch
+
+        - name: "Switch: change hostname"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/sites/{{ mist_site_created['data']['id'] }}/devices/{{ mist_inventory['id'] }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body:
+              name: "{{ switch_hostname }}"
+            body_format: json
+          register: mist_change_switch_hostname
+
+      when: source_site_from_netbox == "No"
+
+    - name: Wireless - Adopt ap claim code in Mist
+      block:
+        - name: "Wireless: build YAML payload for claim code adoption"
+          ansible.builtin.template:
+            src: "templates/mist/claim_ap.j2"
+            dest: "tmp/claim_ap.yaml"
+            mode: 0640
+
+        - name: "Wireless: adopt claim code"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: POST
+            body: "{{ lookup('file', 'tmp/claim_ap.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_ap_claim_result
+
+        - name: "Wireless: clean up ap adoption output"
+          ansible.builtin.set_fact:
+            mist_ap_inventory: "{{ mist_ap_claim_result | clean_claim }}"
+
+      when: source_site_from_netbox == "No"
+
+    - name: Wireless - Assign site, host-name, and management
+      block:
+        - name: "Wireless: build YAML payload for assigning to site"
+          ansible.builtin.template:
+            src: "templates/mist/assign_ap.j2"
+            dest: "tmp/assign_ap.yaml"
+            mode: 0640
+
+        - name: "Wireless: assign to site"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/assign_ap.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_associate_device_to_site
+
+        - name: "Wireless: change hostname"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/integration/sites/{{ mist_site_created['data']['id'] }}/devices/{{ mist_ap_inventory['id']}}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body:
+              name: "{{ ap_hostname }}"
+            body_format: json
+          register: mist_change_ap_hostname
+
+      when: source_site_from_netbox == "No"
+
+    - name: Slack - Notify team
+      block:
+        - name: "Slack: create YAML file for notification"
+          ansible.builtin.template:
+            src: "templates/slack/site.j2"
+            dest: "tmp/slack.yaml"
+            mode: 0640
+
+        - name: "Slack: post slack message"
+          ansible.builtin.uri:
+            url: "https://hooks.slack.com/services/{{ slack.channel }}"
+            return_content: yes
+            status_code: 200
+            method: POST
+            body: "{{ lookup('file', 'tmp/slack.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+
+      when: source_site_from_netbox == "No"
+
+    - name: Netbox - Get details of the site from Netbox
+      block:
+        - name: "Site: Get site information from Netbox"
+          ansible.builtin.uri:
+            url: "http://{{ nsot.url }}/api/dcim/sites/?name={{ site_name }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ nsot.token }}"
+            status_code: 200
+            method: GET
+          register: netbox_site_info
+
+        - name: "Site: Create netbox_site_address object"
+          ansible.builtin.set_fact:
+            netbox_site_address: "{{ netbox_site_info['json']['results'][0]['physical_address'] }}"
+
+        - name: "Site: Create netbox_time_zone object"
+          ansible.builtin.set_fact:
+            netbox_time_zone: "{{ netbox_site_info['json']['results'][0]['time_zone'] }}"
+
+        - name: "Site: Create netbox_latitude object"
+          ansible.builtin.set_fact:
+            netbox_latitude: "{{ netbox_site_info['json']['results'][0]['latitude'] }}"
+
+        - name: "Site: Create netbox_longitude object"
+          ansible.builtin.set_fact:
+            netbox_longitude: "{{ netbox_site_info['json']['results'][0]['longitude'] }}"
+
+        - name: "Site: Create netbox_gps dictionary object"
+          ansible.builtin.set_fact:
+            netbox_gps:
+              latitude: "{{ netbox_latitude }}"
+              longitude: "{{ netbox_longitude }}"
+
+        - name: "Site: Create netbox_gateway_template_class object"
+          ansible.builtin.set_fact:
+            netbox_gateway_template_class: "{{ netbox_site_info['json']['results'][0]['custom_fields']['gateway_template_class'] }}"
+
+        - name: "Site: Create netbox_notes object"
+          ansible.builtin.set_fact:
+            netbox_notes: "{{ netbox_site_info['json']['results'][0]['custom_fields']['notes'] }}"
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Netbox - Get details of the gateway from Netbox
+      block:
+        - name: "Site: Get gateway ID from Netbox"
+          ansible.builtin.uri:
+            url: "http://{{ nsot.url }}/api/dcim/devices/?name={{ gateway_hostname }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ nsot.token }}"
+            status_code: 200
+            method: GET
+          register: netbox_gateway_id
+
+        - name: "Site: Create gateway_id object"
+          ansible.builtin.set_fact:
+            gateway_id: "{{ netbox_gateway_id['json']['results'][0]['id'] }}"
+
+        - name: "Site: Get gateway details from Netbox"
+          ansible.builtin.uri:
+            url: "http://{{ nsot.url }}/api/dcim/devices/{{ gateway_id }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ nsot.token }}"
+            status_code: 200
+            method: GET
+          register: netbox_gateway_info
+
+        - name: "Site: Create netbox_gateway_claim_code object"
+          ansible.builtin.set_fact:
+            netbox_gateway_claim_code: "{{ netbox_gateway_info['json']['local_context_data']['gateway_claim_code'] }}"
+
+        - name: "Site: Create netbox_iot_ip object"
+          ansible.builtin.set_fact:
+            netbox_iot_ip: "{{ netbox_gateway_info['json']['local_context_data']['iot_ip'] }}"
+
+        - name: "Site: Create netbox_wan_ip object"
+          ansible.builtin.set_fact:
+            netbox_wan_ip: "{{ netbox_gateway_info['json']['local_context_data']['wan_ip'] }}"
+
+        - name: "Site: Create netbox_bgp_peer object"
+          ansible.builtin.set_fact:
+            netbox_bgp_peer: "{{ netbox_gateway_info['json']['local_context_data']['bgp_peer'] }}"
+
+        - name: "Site: Create netbox_guest_ip object"
+          ansible.builtin.set_fact:
+            netbox_guest_ip: "{{ netbox_gateway_info['json']['local_context_data']['guest_ip'] }}"
+
+        - name: "Site: Create netbox_corporate_ip object"
+          ansible.builtin.set_fact:
+            netbox_corporate_ip: "{{ netbox_gateway_info['json']['local_context_data']['corporate_ip'] }}"
+
+        - name: "Site: Create netbox_gateway_set_configuration object"
+          ansible.builtin.set_fact:
+            netbox_gateway_set_configuration: "{{ netbox_gateway_info['json']['local_context_data']['additional_config_cmds'] | default('') }}"
+
+        - name: "Site: Create netbox_gateway_bgp_config object"
+          ansible.builtin.set_fact:
+            netbox_gateway_bgp_config: "{{ netbox_gateway_info['json']['local_context_data']['bgp_config'] | default('') }}"
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Netbox - Get details of the switch from Netbox
+      block:
+        - name: "Site: Get switch ID from Netbox"
+          ansible.builtin.uri:
+            url: "http://{{ nsot.url }}/api/dcim/devices/?name={{ switch_hostname }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ nsot.token }}"
+            status_code: 200
+            method: GET
+          register: netbox_switch_id
+
+        - name: "Site: Create netbox_switch_id object"
+          ansible.builtin.set_fact:
+            switch_id: "{{ netbox_switch_id['json']['results'][0]['id'] }}"
+
+        - name: "Site: Get switch details from Netbox"
+          ansible.builtin.uri:
+            url: "http://{{ nsot.url }}/api/dcim/devices/{{ switch_id }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ nsot.token }}"
+            status_code: 200
+            method: GET
+          register: netbox_switch_info
+
+        - name: "Site: Create netbox_switch_claim_code object"
+          ansible.builtin.set_fact:
+            netbox_switch_claim_code: "{{ netbox_switch_info['json']['local_context_data']['switch_claim_code'] }}"
+
+        - name: "Site: Create netbox_switch_management_ip object"
+          ansible.builtin.set_fact:
+            netbox_switch_management_ip: "{{ netbox_switch_info['json']['local_context_data']['switch_management_ip'] }}"
+
+        - name: "Site: Create switch_set_configuration object"
+          ansible.builtin.set_fact:
+            netbox_switch_set_configuration: "{{ netbox_switch_info['json']['local_context_data']['switch_set_configuration'] }}"
+
+        - name: "Site: Create switch_template_class object"
+          ansible.builtin.set_fact:
+            netbox_switch_template_class: "{{ netbox_switch_info['json']['local_context_data']['switch_template_class'] }}"
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Netbox - Get details of the wireless from Netbox
+      block:
+        - name: "Site: Get AP ID from Netbox"
+          ansible.builtin.uri:
+            url: "http://{{ nsot.url }}/api/dcim/devices/?name={{ ap_hostname }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ nsot.token }}"
+            status_code: 200
+            method: GET
+          register: netbox_ap_id
+
+        - name: "Site: Create netbox_ap_id object"
+          ansible.builtin.set_fact:
+            ap_id: "{{ netbox_ap_id['json']['results'][0]['id'] }}"
+
+        - name: "Site: Get ap details from Netbox"
+          ansible.builtin.uri:
+            url: "http://{{ nsot.url }}/api/dcim/devices/{{ ap_id }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ nsot.token }}"
+            status_code: 200
+            method: GET
+          register: netbox_ap_info
+
+        - name: "Site: Create netbox_ap_claim_code object"
+          ansible.builtin.set_fact:
+            netbox_ap_claim_code: "{{ netbox_ap_info['json']['local_context_data']['claim_code'] }}"
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Site - Create site in Mist with parameters from Netbox
+      block:
+        - name: "Site: create a new site in Mist"
+          cdot65.mist.site:
+            baseurl: "{{ mist.url }}"
+            name: "{{ site_name }}"
+            address: "{{ netbox_site_address }}"
+            country_code: "US"
+            timezone: "{{ netbox_time_zone }}"
+            latlng:
+              lat: "{{ netbox_gps['latitude'] }}"
+              lng: "{{ netbox_gps['longitude'] }}"
+            gatewaytemplate_id: "{{ netbox_gateway_template_class }}"
+            notes: "{{ netbox_notes }}"
+            api_token: "{{ mist.token }}"
+            org_id: "{{ mist.org }}"
+            state: present
+          register: mist_site_created
+
+        - name: "Site: create YAML file for our site variables"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/site_vars.j2"
+            dest: "tmp/site_vars.yaml"
+            mode: 0640
+
+        - name: "Site: update site with variables"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/sites/{{ mist_site_created['data']['id'] }}/setting"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/site_vars.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_site_vars
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Gateway - Adopt gateway claim code in Mist
+      block:
+        - name: "Gateway: build YAML payload for adoption process"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/gateway_claim.j2"
+            dest: "tmp/gateway_claim.yaml"
+            mode: 0640
+
+        - name: "Gateway: adopt claim code"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: POST
+            body: "{{ lookup('file', 'tmp/gateway_claim.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_gateway_claim_result
+
+        - name: "Gateway: clean up adoption output"
+          ansible.builtin.set_fact:
+            mist_inventory: "{{ mist_gateway_claim_result | clean_claim }}"
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Gateway - Assign site, host-name, and management
+      block:
+        - name: "Gateway: build YAML payload for associating a gateway to a site"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/gateway_assign.j2"
+            dest: "tmp/gateway_assign.yaml"
+            mode: 0640
+
+        - name: "Gateway: associate gateway to site"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/gateway_assign.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_associate_device_to_site
+
+        - name: "Gateway: build YAML payload for configuration management"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/gateway_manage.j2"
+            dest: "tmp/gateway_manage.yaml"
+            mode: 0640
+
+        - name: "Gateway: manage the gateway configuration"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/sites/{{ mist_site_created['data']['id'] }}/devices/{{ mist_inventory['id'] }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/gateway_manage.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_manage_gateway
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Gateway - Create device-level configuration for the gateway
+      block:
+        - name: "Gateway: create a device configuration"
+          cdot65.mist.gateway:
+            # mist parameters
+            baseurl: "{{ mist.url }}"
+            api_token: "{{ mist.token }}"
+            org_id: "{{ mist.org }}"
+
+            # srx parameters
+            name: "{{ gateway_hostname }}"
+            site_name: "{{ site_name }}"
+            bgp_config:
+              - name: "ATT"
+                type: "external"
+                local_as: 42551
+                auth_key: "juniper123"
+                export_policy: "direct"
+                neighbors:
+                  - name: "{{ netbox_bgp_peer }}"
+                    neighbor_as: 42550
+                    export_policy: "direct"
+                    import_policy: ""
+            additional_config_cmds:
+              - "set protocols bgp group ATT local-address {{ netbox_wan_ip }}"
+            state: "present"
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Switch - Adopt switch claim code in Mist
+      block:
+        - name: "Switch: build YAML payload for claim code adoption"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/switch_claim.j2"
+            dest: "tmp/switch_claim.yaml"
+            mode: 0640
+
+        - name: "Switch: adopt claim code"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: POST
+            body: "{{ lookup('file', 'tmp/switch_claim.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_switch_claim_result
+
+        - name: "Switch: clean up switch adoption output"
+          ansible.builtin.set_fact:
+            mist_switch_inventory: "{{ mist_switch_claim_result | clean_claim }}"
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Switch - Assign site, host-name, and management
+      block:
+        - name: "Switch: build YAML payload for assigning to site"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/switch_assign.j2"
+            dest: "tmp/switch_assign.yaml"
+            mode: 0640
+
+        - name: "Switch: assign to site"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/switch_assign.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_associate_device_to_site
+
+        - name: "Switch: build YAML to assign switch configuration template to site"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/switch_manage.j2"
+            dest: "tmp/switch_manage.yaml"
+            mode: 0640
+
+        - name: "Switch: assign switch configuration template"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/integration/sites/{{ mist_site_created['data']['id'] }}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/switch_manage.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_manage_switch
+
+        - name: "Switch: change hostname"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/integration/sites/{{ mist_site_created['data']['id'] }}/devices/{{ mist_switch_inventory['id']}}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body:
+              name: "{{ switch_hostname }}"
+            body_format: json
+          register: mist_change_switch_hostname
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Wireless - Adopt ap claim code in Mist
+      block:
+        - name: "Wireless: build YAML payload for claim code adoption"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/claim_ap.j2"
+            dest: "tmp/claim_ap.yaml"
+            mode: 0640
+
+        - name: "Wireless: adopt claim code"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: POST
+            body: "{{ lookup('file', 'tmp/claim_ap.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_ap_claim_result
+
+        - name: "Wireless: clean up ap adoption output"
+          ansible.builtin.set_fact:
+            mist_ap_inventory: "{{ mist_ap_claim_result | clean_claim }}"
+
+      when: source_site_from_netbox == "Yes"
+
+    - name: Wireless - Assign site, host-name, and management
+      block:
+        - name: "Wireless: build YAML payload for assigning to site"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/assign_ap.j2"
+            dest: "tmp/assign_ap.yaml"
+            mode: 0640
+
+        - name: "Wireless: assign to site"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/api/v1/orgs/{{ mist.org }}/inventory"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body: "{{ lookup('file', 'tmp/assign_ap.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+          register: mist_associate_device_to_site
+
+        - name: "Wireless: change hostname"
+          ansible.builtin.uri:
+            url: "https://api.mistsys.com/integration/sites/{{ mist_site_created['data']['id'] }}/devices/{{ mist_ap_inventory['id']}}"
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Token {{ mist.token }}"
+            status_code: 200
+            method: PUT
+            body:
+              name: "{{ ap_hostname }}"
+            body_format: json
+          register: mist_change_ap_hostname
+      when: source_site_from_netbox == "Yes"
+
+    - name: Slack - Notify team
+      block:
+        - name: "Slack: create YAML file for notification"
+          ansible.builtin.template:
+            src: "templates/mist/netbox/slack_site.j2"
+            dest: "tmp/slack_site.yaml"
+            mode: 0640
+
+        - name: "Slack: post slack message"
+          ansible.builtin.uri:
+            url: "https://hooks.slack.com/services/{{ slack.channel }}"
+            return_content: yes
+            status_code: 200
+            method: POST
+            body: "{{ lookup('file', 'tmp/slack_site.yaml' ) | from_yaml | to_json }}"
+            body_format: json
+
+      when: source_site_from_netbox == "Yes"
